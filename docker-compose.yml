@@ -1,0 +1,117 @@
+services:
+  # LlamaFactory - Training Framework
+  llamafactory:
+    image: hiyouga/llamafactory:latest
+    container_name: llamafactory-trainer
+    volumes:
+      # Shared volume for models (read Llama 3.1 from here)
+      - shared-models:/workspace/models
+      # Training data
+      - ./training-data:/workspace/data
+      # Output for trained models
+      - ./output:/workspace/output
+      # Training configurations
+      - ./configs:/workspace/configs
+      # Scripts
+      - ./scripts:/workspace/scripts
+    working_dir: /workspace
+    ports:
+      - "7860:7860"  # WebUI
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - GRADIO_SERVER_NAME=0.0.0.0
+    # Start WebUI to keep container running
+    command: llamafactory-cli webui
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - llama-network
+
+  # Ollama - Model serving (optional, for inference)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama-server
+    volumes:
+      # Same shared volume - can read/write models
+      - shared-models:/models
+      - ollama-data:/root/.ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - llama-network
+
+  # Model Downloader - One-time container to download Llama 3.1
+  model-downloader:
+    image: python:3.11-slim
+    container_name: llama-model-downloader
+    volumes:
+      # Write model to shared volume
+      - shared-models:/models
+      - ./scripts:/scripts
+    working_dir: /scripts
+    environment:
+      - HF_TOKEN=inserttokenhere
+    # This container exits after downloading - that's normal
+    command: >
+      bash -c "
+        pip install -q huggingface-hub transformers &&
+        python download_model.py
+      "
+    profiles:
+      - setup
+    networks:
+      - llama-network
+
+volumes:
+  # Shared volume accessible by all containers
+  shared-models:
+    driver: local
+  ollama-data:
+    driver: local
+
+networks:
+  llama-network:
+    driver: bridge
+
+# ==============================================================================
+# USAGE INSTRUCTIONS
+# ==============================================================================
+#
+# 1. First-time setup - Download Llama 3.1:
+#    export HF_TOKEN='your_huggingface_token'
+#    docker-compose --profile setup run --rm model-downloader
+#
+# 2. Start LlamaFactory for training:
+#    docker-compose up -d llamafactory
+#
+# 3. Access WebUI:
+#    http://localhost:7860
+#
+# 4. Or use CLI inside container:
+#    docker-compose exec llamafactory bash
+#    llamafactory-cli train configs/training_config.yaml
+#
+# 5. After training, start Ollama to serve the model:
+#    docker-compose up -d ollama
+#
+# 6. Import trained model to Ollama:
+#    docker exec ollama ollama create my-model -f /models/Modelfile
+#
+# ===============================================

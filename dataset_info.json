@@ -1,0 +1,11 @@
+{
+  "financial_csv_data": {
+    "file_name": "financial_training_data.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  }
+}

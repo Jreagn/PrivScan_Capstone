@@ -1,0 +1,48 @@
+### Model Configuration
+model_name_or_path: /workspace/models/llama3.1-8b-instruct
+
+### Dataset Configuration
+dataset: financial_csv_data
+template: llama3
+cutoff_len: 2048
+max_samples: 10000
+overwrite_cache: true
+preprocessing_num_workers: 4
+
+### Output Configuration
+output_dir: /workspace/output/llama3.1-financial
+logging_steps: 10
+save_steps: 100
+save_total_limit: 3
+overwrite_output_dir: false
+
+### Training Hyperparameters
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+learning_rate: 5.0e-5
+num_train_epochs: 3
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+
+### Optimization
+fp16: true
+optim: adamw_torch
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+### LoRA Configuration
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
+lora_dropout: 0.05
+
+### Evaluation
+evaluation_strategy: steps
+eval_steps: 100
+val_size: 0.1
+per_device_eval_batch_size: 2
+
+### Logging
+logging_dir: /workspace/output/logs
+report_to: tensorboard
