@@ -23,10 +23,10 @@ class PrivScanGUI:
         style = ttk.Style()
         style.theme_use("clam")
 
-        self.bg = "#2b2f36"      # dark grey
-        self.panel = "#343a43"   # slightly lighter grey
-        self.blue = "#2f81f7"    # blue accent
-        self.text = "#e6edf3"    # near-white text
+        self.bg = "#2b2f36"      
+        self.panel = "#343a43"   
+        self.blue = "#2f81f7"    
+        self.text = "#e6edf3"    
 
         self.root.configure(bg=self.bg)
         style.configure("TFrame", background=self.bg)
@@ -56,7 +56,6 @@ class PrivScanGUI:
         panel.pack(fill="both", expand=True)
 
 
-        # server config row
         cfg = ttk.Frame(panel, style="Panel.TFrame")
         cfg.pack(fill="x", padx=14, pady=(14, 8))
 
@@ -69,7 +68,6 @@ class PrivScanGUI:
         cfg.columnconfigure(1, weight=1)
 
 
-        # file row
         file_row = ttk.Frame(panel, style="Panel.TFrame")
         file_row.pack(fill="x", padx=14, pady=10)
 
@@ -79,7 +77,6 @@ class PrivScanGUI:
         ttk.Button(file_row, text="Import File…", command=self.import_file, style="Accent.TButton").pack(side="right")
 
 
-        # action row
         actions = ttk.Frame(panel, style="Panel.TFrame")
         actions.pack(fill="x", padx=14, pady=10)
 
@@ -87,7 +84,6 @@ class PrivScanGUI:
         ttk.Button(actions, text="Clear", command=self.clear).pack(side="left", padx=(10, 0))
 
 
-        # status box
         status = ttk.Frame(panel, style="Panel.TFrame")
         status.pack(fill="both", expand=True, padx=14, pady=(10, 14))
 
@@ -95,7 +91,6 @@ class PrivScanGUI:
         ttk.Label(status, textvariable=self.status_var, style="Panel.TLabel", wraplength=660, justify="left").pack(anchor="w", pady=(8, 0))
 
 
-    # callbacks
     def import_file(self):
         path = filedialog.askopenfilename(title="Select a file to upload")
         if not path:
@@ -123,31 +118,32 @@ class PrivScanGUI:
 
         self.status_var.set(f"Uploading to {url} …")
 
-
-        # run upload in a background thread so the UI doesn’t freeze
         t = threading.Thread(target=self._upload_thread, args=(url, self.selected_file), daemon=True)
         t.start()
 
 
     def _upload_thread(self, url: str, file_path: Path):
+        def file_chunks(path, chunk_size=4 * 1024 * 1024):
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
         try:
             with file_path.open("rb") as f:
-                files = {"file": (file_path.name, f)}
-                resp = requests.post(url, files=files, timeout=300)
+                resp = requests.post(url, data=file_chunks(file_path), headers={"X-Filename": file_path.name}, timeout=None)
 
-            # update UI safely via root.after
             if resp.status_code != 200:
                 self.root.after(0, lambda: self.status_var.set(f"Server error {resp.status_code}:\n{resp.text[:500]}"))
                 return
 
-            # if server returns JSON:
             content_type = resp.headers.get("content-type", "")
             if "application/json" in content_type:
                 data = resp.json()
                 self.root.after(0, lambda: self.status_var.set(f"Success (JSON):\n{data}"))
                 return
 
-            # otherwise, treat it as a file download
             save_path = filedialog.asksaveasfilename(
                 title="Save server response",
                 initialfile=f"response_{file_path.stem}",
