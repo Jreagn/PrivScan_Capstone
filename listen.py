@@ -16,13 +16,23 @@ def scan():
 
     dest = UPLOAD_DIR / filename
     chunk_size = 256 * 1024
+    content_length = request.content_length
 
     with open(dest, "wb") as f:
-        while True:
-            chunk = request.stream.read(chunk_size)
-            if not chunk:
-                break
-            f.write(chunk)
+        if content_length is not None:
+            remaining = content_length
+            while remaining > 0:
+                chunk = request.stream.read(min(chunk_size, remaining))
+                if not chunk:
+                    break
+                f.write(chunk)
+                remaining -= len(chunk)
+        else:
+            while True:
+                chunk = request.stream.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
 
     return "File received", 200
 
