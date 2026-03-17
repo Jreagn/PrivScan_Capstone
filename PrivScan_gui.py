@@ -131,8 +131,14 @@ class PrivScanGUI:
                         break
                     yield chunk
         try:
-            with file_path.open("rb") as f:
-                resp = requests.post(url, data=file_chunks(file_path), headers={"X-Filename": file_path.name}, timeout=None)
+            session = requests.Session()
+            session.trust_env = False  # bypass system proxy settings for LAN IPs
+            resp = session.post(
+                url,
+                data=file_chunks(file_path),
+                headers={"X-Filename": file_path.name},
+                timeout=(10, 600),
+            )
 
             if resp.status_code != 200:
                 self.root.after(0, lambda: self.status_var.set(f"Server error {resp.status_code}:\n{resp.text[:500]}"))
@@ -170,3 +176,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
