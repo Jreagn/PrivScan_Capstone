@@ -4,11 +4,12 @@ import threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 
 import requests
 
 
-DEFAULT_SERVER = "http://65.183.147.192:65432"
+DEFAULT_SERVER = "http://scan.audio-sync.com"
 DEFAULT_ENDPOINT = "/scan"  # @John, change this if the server uses a different path
 
 
@@ -131,6 +132,11 @@ class PrivScanGUI:
                         break
                     yield chunk
         try:
+            parts = urlsplit(url)
+            query = dict(parse_qsl(parts.query))
+            query.setdefault("filename", file_path.name)
+            url = urlunsplit(parts._replace(query=urlencode(query)))
+
             session = requests.Session()
             session.trust_env = False  # bypass system proxy settings for LAN IPs
             resp = session.post(
@@ -176,4 +182,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
