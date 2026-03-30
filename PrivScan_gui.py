@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -11,6 +12,8 @@ import requests
 
 DEFAULT_SERVER = "http://scan.audio-sync.com"
 DEFAULT_ENDPOINT = "/scan"  # @John, change this if the server uses a different path
+DEFAULT_POLL_INTERVAL_SEC = 5
+DEFAULT_POLL_TIMEOUT_SEC = 3600
 
 
 class PrivScanGUI:
@@ -129,6 +132,23 @@ class PrivScanGUI:
 
 
     def _upload_thread(self, url: str, file_path: Path, prompt: str):
+        def poll_job(session: requests.Session, job_url: str):
+            start = time.time()
+            while True:
+                if time.time() - start > DEFAULT_POLL_TIMEOUT_SEC:
+                    return None, "Timed out waiting for the server job."
+                try:
+                    resp = session.get(job_url, timeout=(10, 30))
+                except requests.Timeout:
+                    time.sleep(DEFAULT_POLL_INTERVAL_SEC)
+                    continue
+                if resp.status_code == 202:
+                    time.sleep(DEFAULT_POLL_INTERVAL_SEC)
+                    continue
+                if resp.status_code == 200:
+                    return resp, None
+                return resp, f"Server error {resp.status_code}:\n{resp.text[:500]}"
+
         def file_chunks(path, chunk_size=4 * 1024 * 1024):
             with open(path, "rb") as f:
                 while True:
@@ -165,7 +185,25 @@ class PrivScanGUI:
                     timeout=(10, 600),
                 )
 
-            if resp.status_code != 200:
+            if resp.status_code == 202:
+                try:
+                    data = resp.json()
+                except Exception:
+                    self.root.after(0, lambda: self.status_var.set("Server queued the job but returned invalid JSON."))
+                    return
+                status_url = data.get("status_url")
+                if not status_url:
+                    self.root.after(0, lambda: self.status_var.set("Server queued the job but did not return status_url."))
+                    return
+                job_url = status_url
+                if status_url.startswith("/"):
+                    job_url = f"{parts.scheme}://{parts.netloc}{status_url}"
+                self.root.after(0, lambda: self.status_var.set(f"Queued. Polling job status…\n{job_url}"))
+                resp, err = poll_job(session, job_url)
+                if err:
+                    self.root.after(0, lambda message=err: self.status_var.set(message))
+                    return
+            elif resp.status_code != 200:
                 self.root.after(0, lambda: self.status_var.set(f"Server error {resp.status_code}:\n{resp.text[:500]}"))
                 return
 
