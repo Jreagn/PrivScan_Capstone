@@ -44,6 +44,7 @@ class PrivScanGUI:
         self.status_var = tk.StringVar(value="Choose a file to upload.")
         self.server_var = tk.StringVar(value=DEFAULT_SERVER)
         self.endpoint_var = tk.StringVar(value=DEFAULT_ENDPOINT)
+        self.prompt_var = tk.StringVar(value="")
 
         self._build()
 
@@ -65,6 +66,9 @@ class PrivScanGUI:
 
         ttk.Label(cfg, text="Endpoint:", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(cfg, textvariable=self.endpoint_var, width=45).grid(row=1, column=1, sticky="we", padx=(10, 0), pady=(8, 0))
+
+        ttk.Label(cfg, text="Additional context:", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(cfg, textvariable=self.prompt_var, width=45).grid(row=2, column=1, sticky="we", padx=(10, 0), pady=(8, 0))
 
         cfg.columnconfigure(1, weight=1)
 
@@ -119,11 +123,12 @@ class PrivScanGUI:
 
         self.status_var.set(f"Uploading to {url} …")
 
-        t = threading.Thread(target=self._upload_thread, args=(url, self.selected_file), daemon=True)
+        prompt = self.prompt_var.get().strip()
+        t = threading.Thread(target=self._upload_thread, args=(url, self.selected_file, prompt), daemon=True)
         t.start()
 
 
-    def _upload_thread(self, url: str, file_path: Path):
+    def _upload_thread(self, url: str, file_path: Path, prompt: str):
         def file_chunks(path, chunk_size=4 * 1024 * 1024):
             with open(path, "rb") as f:
                 while True:
@@ -132,19 +137,33 @@ class PrivScanGUI:
                         break
                     yield chunk
         try:
+            file_size = file_path.stat().st_size
             parts = urlsplit(url)
             query = dict(parse_qsl(parts.query))
             query.setdefault("filename", file_path.name)
+            if prompt:
+                query.setdefault("prompt", prompt)
             url = urlunsplit(parts._replace(query=urlencode(query)))
 
             session = requests.Session()
             session.trust_env = False  # bypass system proxy settings for LAN IPs
-            resp = session.post(
-                url,
-                data=file_chunks(file_path),
-                headers={"X-Filename": file_path.name},
-                timeout=(10, 600),
-            )
+            headers = {"X-Filename": file_path.name}
+            if file_size <= 10 * 1024 * 1024:
+                payload = file_path.read_bytes()
+                headers["Content-Length"] = str(len(payload))
+                resp = session.post(
+                    url,
+                    data=payload,
+                    headers=headers,
+                    timeout=(10, 600),
+                )
+            else:
+                resp = session.post(
+                    url,
+                    data=file_chunks(file_path),
+                    headers=headers,
+                    timeout=(10, 600),
+                )
 
             if resp.status_code != 200:
                 self.root.after(0, lambda: self.status_var.set(f"Server error {resp.status_code}:\n{resp.text[:500]}"))
@@ -182,3 +201,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
