@@ -142,10 +142,17 @@ class PrivScanGUI:
                 except requests.Timeout:
                     time.sleep(DEFAULT_POLL_INTERVAL_SEC)
                     continue
-                if resp.status_code == 202:
-                    time.sleep(DEFAULT_POLL_INTERVAL_SEC)
-                    continue
                 if resp.status_code == 200:
+                    try:
+                        payload = resp.json()
+                    except Exception:
+                        return None, "Server returned invalid JSON during polling."
+                    status = payload.get("status")
+                    if status in ("queued", "running"):
+                        time.sleep(DEFAULT_POLL_INTERVAL_SEC)
+                        continue
+                    if status == "error":
+                        return resp, f"Server error:\n{payload.get('error') or payload.get('result')}"
                     return resp, None
                 return resp, f"Server error {resp.status_code}:\n{resp.text[:500]}"
 
@@ -210,6 +217,8 @@ class PrivScanGUI:
             content_type = resp.headers.get("content-type", "")
             if "application/json" in content_type:
                 data = resp.json()
+                if isinstance(data, dict) and data.get("status") in ("done", "error") and "result" in data:
+                    data = data["result"]
                 self.root.after(0, lambda: self.status_var.set(f"Success (JSON):\n{data}"))
                 return
 
@@ -239,4 +248,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
