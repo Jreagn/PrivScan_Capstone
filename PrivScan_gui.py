@@ -137,8 +137,13 @@ class PrivScanGUI:
             while True:
                 if time.time() - start > DEFAULT_POLL_TIMEOUT_SEC:
                     return None, "Timed out waiting for the server job."
+                cache_buster = f"{job_url}?t={int(time.time())}"
                 try:
-                    resp = session.get(job_url, timeout=(10, 30))
+                    resp = session.get(
+                        cache_buster,
+                        timeout=(10, 30),
+                        headers={"Cache-Control": "no-cache"},
+                    )
                 except requests.Timeout:
                     time.sleep(DEFAULT_POLL_INTERVAL_SEC)
                     continue
@@ -148,7 +153,9 @@ class PrivScanGUI:
                     except Exception:
                         return None, "Server returned invalid JSON during polling."
                     status = payload.get("status")
-                    if status in ("queued", "running"):
+                    if status in ("queued", "running", "pending", "processing") or status is None:
+                        if status is None and (payload.get("llama_output") or payload.get("llama_error")):
+                            return resp, None
                         time.sleep(DEFAULT_POLL_INTERVAL_SEC)
                         continue
                     if status == "error":
@@ -220,6 +227,15 @@ class PrivScanGUI:
                 if isinstance(data, dict) and data.get("status") in ("done", "error") and "result" in data:
                     data = data["result"]
                 self.root.after(0, lambda: self.status_var.set(f"Success (JSON):\n{data}"))
+                save_path = filedialog.asksaveasfilename(
+                    title="Save server response",
+                    initialfile=f"response_{file_path.stem}.json",
+                )
+                if not save_path:
+                    self.root.after(0, lambda: self.status_var.set("Upload succeeded, but you cancelled saving the JSON response."))
+                    return
+                Path(save_path).write_text(str(data), encoding="utf-8")
+                self.root.after(0, lambda: self.status_var.set(f"Done! Saved response to:\n{save_path}"))
                 return
 
             save_path = filedialog.asksaveasfilename(
@@ -248,3 +264,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
