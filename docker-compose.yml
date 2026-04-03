@@ -4,7 +4,7 @@ services:
     image: hiyouga/llamafactory:latest
     container_name: llamafactory-trainer
     volumes:
-      # Shared volume for models (read Llama 3.1 from here)
+      # Shared volume for base models
       - shared-models:/workspace/models
       # Training data
       - ./training-data:/workspace/data
@@ -57,7 +57,7 @@ services:
     networks:
       - llama-network
 
-  # Model Downloader - One-time container to download Llama 3.1
+  # Model Downloader - One-time container to download a base model
   model-downloader:
     image: python:3.11-slim
     container_name: llama-model-downloader
@@ -94,7 +94,7 @@ networks:
 # USAGE INSTRUCTIONS
 # ==============================================================================
 #
-# 1. First-time setup - Download Llama 3.1:
+# 1. First-time setup - Download the default Qwen 2.5 7B model:
 #    export HF_TOKEN='your_huggingface_token'
 #    docker-compose --profile setup run --rm model-downloader
 #
