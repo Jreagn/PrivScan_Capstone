@@ -4,14 +4,14 @@ import threading
 import time
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
+from tkinter import filedialog, messagebox, ttk
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 
 
 DEFAULT_SERVER = "http://scan.audio-sync.com"
-DEFAULT_ENDPOINT = "/scan"  # @John, change this if the server uses a different path
+DEFAULT_ENDPOINT = "/scan"
 DEFAULT_POLL_INTERVAL_SEC = 5
 DEFAULT_POLL_TIMEOUT_SEC = 3600
 
@@ -19,18 +19,17 @@ DEFAULT_POLL_TIMEOUT_SEC = 3600
 class PrivScanGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("PrivScan Uploader")
+        self.root.title("PrivScan Hidden-Data Detector")
         self.root.geometry("720x420")
         self.root.minsize(640, 380)
 
-        # PrivScan's theme (I like blue and grey)
         style = ttk.Style()
         style.theme_use("clam")
 
-        self.bg = "#2b2f36"      
-        self.panel = "#343a43"   
-        self.blue = "#2f81f7"    
-        self.text = "#e6edf3"    
+        self.bg = "#2b2f36"
+        self.panel = "#343a43"
+        self.blue = "#2f81f7"
+        self.text = "#e6edf3"
 
         self.root.configure(bg=self.bg)
         style.configure("TFrame", background=self.bg)
@@ -39,12 +38,14 @@ class PrivScanGUI:
         style.configure("Panel.TLabel", background=self.panel, foreground=self.text, font=("Segoe UI", 11))
         style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"))
         style.configure("TButton", font=("Segoe UI", 11), padding=8)
-        style.map("Accent.TButton",
-                  foreground=[("active", "white"), ("!active", "white")],
-                  background=[("active", self.blue), ("!active", self.blue)])
+        style.map(
+            "Accent.TButton",
+            foreground=[("active", "white"), ("!active", "white")],
+            background=[("active", self.blue), ("!active", self.blue)],
+        )
 
         self.selected_file: Path | None = None
-        self.status_var = tk.StringVar(value="Choose a file to upload.")
+        self.status_var = tk.StringVar(value="Choose a file to scan for hidden data.")
         self.server_var = tk.StringVar(value=DEFAULT_SERVER)
         self.endpoint_var = tk.StringVar(value=DEFAULT_ENDPOINT)
         self.prompt_var = tk.StringVar(value="")
@@ -55,11 +56,10 @@ class PrivScanGUI:
         outer = ttk.Frame(self.root)
         outer.pack(fill="both", expand=True, padx=18, pady=18)
 
-        ttk.Label(outer, text="PrivScan Uploader", style="Title.TLabel").pack(anchor="w", pady=(0, 10))
+        ttk.Label(outer, text="PrivScan Hidden-Data Detector", style="Title.TLabel").pack(anchor="w", pady=(0, 10))
 
         panel = ttk.Frame(outer, style="Panel.TFrame")
         panel.pack(fill="both", expand=True)
-
 
         cfg = ttk.Frame(panel, style="Panel.TFrame")
         cfg.pack(fill="x", padx=14, pady=(14, 8))
@@ -70,11 +70,10 @@ class PrivScanGUI:
         ttk.Label(cfg, text="Endpoint:", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(cfg, textvariable=self.endpoint_var, width=45).grid(row=1, column=1, sticky="we", padx=(10, 0), pady=(8, 0))
 
-        ttk.Label(cfg, text="Additional context:", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(cfg, text="Detection notes:", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(cfg, textvariable=self.prompt_var, width=45).grid(row=2, column=1, sticky="we", padx=(10, 0), pady=(8, 0))
 
         cfg.columnconfigure(1, weight=1)
-
 
         file_row = ttk.Frame(panel, style="Panel.TFrame")
         file_row.pack(fill="x", padx=14, pady=10)
@@ -82,8 +81,7 @@ class PrivScanGUI:
         self.file_label = ttk.Label(file_row, text="No file selected.", style="Panel.TLabel")
         self.file_label.pack(side="left", fill="x", expand=True)
 
-        ttk.Button(file_row, text="Import File…", command=self.import_file, style="Accent.TButton").pack(side="right")
-
+        ttk.Button(file_row, text="Import File...", command=self.import_file, style="Accent.TButton").pack(side="right")
 
         actions = ttk.Frame(panel, style="Panel.TFrame")
         actions.pack(fill="x", padx=14, pady=10)
@@ -91,26 +89,24 @@ class PrivScanGUI:
         ttk.Button(actions, text="Upload", command=self.upload_clicked, style="Accent.TButton").pack(side="left")
         ttk.Button(actions, text="Clear", command=self.clear).pack(side="left", padx=(10, 0))
 
-
         status = ttk.Frame(panel, style="Panel.TFrame")
         status.pack(fill="both", expand=True, padx=14, pady=(10, 14))
 
         ttk.Label(status, text="Status:", style="Panel.TLabel").pack(anchor="w")
         ttk.Label(status, textvariable=self.status_var, style="Panel.TLabel", wraplength=660, justify="left").pack(anchor="w", pady=(8, 0))
 
-
     def import_file(self):
-        path = filedialog.askopenfilename(title="Select a file to upload")
+        path = filedialog.askopenfilename(title="Select a file to scan")
         if not path:
             return
         self.selected_file = Path(path)
         self.file_label.config(text=str(self.selected_file))
-        self.status_var.set("Ready to upload.")
+        self.status_var.set("Ready to scan.")
 
     def clear(self):
         self.selected_file = None
         self.file_label.config(text="No file selected.")
-        self.status_var.set("Choose a file to upload.")
+        self.status_var.set("Choose a file to scan for hidden data.")
 
     def upload_clicked(self):
         if not self.selected_file or not self.selected_file.exists():
@@ -123,13 +119,11 @@ class PrivScanGUI:
             endpoint = "/" + endpoint
 
         url = f"{server}{endpoint}"
-
-        self.status_var.set(f"Uploading to {url} …")
+        self.status_var.set(f"Uploading to {url} for hidden-data detection...")
 
         prompt = self.prompt_var.get().strip()
         t = threading.Thread(target=self._upload_thread, args=(url, self.selected_file, prompt), daemon=True)
         t.start()
-
 
     def _upload_thread(self, url: str, file_path: Path, prompt: str):
         def poll_job(session: requests.Session, job_url: str):
@@ -154,7 +148,7 @@ class PrivScanGUI:
                         return None, "Server returned invalid JSON during polling."
                     status = payload.get("status")
                     if status in ("queued", "running", "pending", "processing") or status is None:
-                        if status is None and (payload.get("llama_output") or payload.get("llama_error")):
+                        if status is None and (payload.get("analysis_result") or payload.get("llama_output") or payload.get("llama_error")):
                             return resp, None
                         time.sleep(DEFAULT_POLL_INTERVAL_SEC)
                         continue
@@ -163,13 +157,14 @@ class PrivScanGUI:
                     return resp, None
                 return resp, f"Server error {resp.status_code}:\n{resp.text[:500]}"
 
-        def file_chunks(path, chunk_size=4 * 1024 * 1024):
+        def file_chunks(path: Path, chunk_size: int = 4 * 1024 * 1024):
             with open(path, "rb") as f:
                 while True:
                     chunk = f.read(chunk_size)
                     if not chunk:
                         break
                     yield chunk
+
         try:
             file_size = file_path.stat().st_size
             parts = urlsplit(url)
@@ -180,24 +175,14 @@ class PrivScanGUI:
             url = urlunsplit(parts._replace(query=urlencode(query)))
 
             session = requests.Session()
-            session.trust_env = False  # bypass system proxy settings for LAN IPs
+            session.trust_env = False
             headers = {"X-Filename": file_path.name}
             if file_size <= 10 * 1024 * 1024:
                 payload = file_path.read_bytes()
                 headers["Content-Length"] = str(len(payload))
-                resp = session.post(
-                    url,
-                    data=payload,
-                    headers=headers,
-                    timeout=(10, 600),
-                )
+                resp = session.post(url, data=payload, headers=headers, timeout=(10, 600))
             else:
-                resp = session.post(
-                    url,
-                    data=file_chunks(file_path),
-                    headers=headers,
-                    timeout=(10, 600),
-                )
+                resp = session.post(url, data=file_chunks(file_path), headers=headers, timeout=(10, 600))
 
             if resp.status_code == 202:
                 try:
@@ -212,7 +197,7 @@ class PrivScanGUI:
                 job_url = status_url
                 if status_url.startswith("/"):
                     job_url = f"{parts.scheme}://{parts.netloc}{status_url}"
-                self.root.after(0, lambda: self.status_var.set(f"Queued. Polling job status…\n{job_url}"))
+                self.root.after(0, lambda: self.status_var.set(f"Queued. Polling job status...\n{job_url}"))
                 resp, err = poll_job(session, job_url)
                 if err:
                     self.root.after(0, lambda message=err: self.status_var.set(message))
@@ -229,7 +214,7 @@ class PrivScanGUI:
                 self.root.after(0, lambda: self.status_var.set(f"Success (JSON):\n{data}"))
                 save_path = filedialog.asksaveasfilename(
                     title="Save server response",
-                    initialfile=f"response_{file_path.stem}.json",
+                    initialfile=f"response_{file_path.stem}_detection.json",
                 )
                 if not save_path:
                     self.root.after(0, lambda: self.status_var.set("Upload succeeded, but you cancelled saving the JSON response."))
@@ -240,7 +225,7 @@ class PrivScanGUI:
 
             save_path = filedialog.asksaveasfilename(
                 title="Save server response",
-                initialfile=f"response_{file_path.stem}",
+                initialfile=f"response_{file_path.stem}_detection",
             )
             if not save_path:
                 self.root.after(0, lambda: self.status_var.set("Upload succeeded, but you cancelled saving the response."))
