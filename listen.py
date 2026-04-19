@@ -41,13 +41,13 @@ import re
 import threading
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 800 * 1024 * 1024 * 1024
 app.logger.setLevel(logging.INFO)
-CODE_VERSION = "2026-04-18-detection-gate-5"
+CODE_VERSION = "2026-04-18-detection-gate-14"
 CODE_SOURCE = str(Path(__file__).resolve())
 
 UPLOAD_DIR = Path("uploads")
@@ -57,6 +57,12 @@ OLLAMA_CONTAINER = os.environ.get("OLLAMA_CONTAINER", "ollama-server")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "privscan-8b-next")
 OLLAMA_FALLBACK_MODEL = os.environ.get("OLLAMA_FALLBACK_MODEL", "privscan-8b").strip()
 DETECTION_EVIDENCE_MODE = os.environ.get("DETECTION_EVIDENCE_MODE", "broad").strip().lower() or "broad"
+HIDDEN_PRESENCE_ALLOW_FALLBACK = os.environ.get("HIDDEN_PRESENCE_ALLOW_FALLBACK", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "3600"))
 CONTEXT_MAX_BYTES = int(os.environ.get("CONTEXT_MAX_BYTES", "8192"))
 CONTEXT_TAIL_BYTES = int(os.environ.get("CONTEXT_TAIL_BYTES", "2048"))
@@ -69,10 +75,14 @@ STRINGS_CARRY_BYTES = int(os.environ.get("STRINGS_CARRY_BYTES", "4096"))
 OLLAMA_FAMILY_TIMEOUT = int(os.environ.get("OLLAMA_FAMILY_TIMEOUT", "420"))
 OLLAMA_VERIFY_TIMEOUT = int(os.environ.get("OLLAMA_VERIFY_TIMEOUT", "900"))
 OLLAMA_BROAD_TIMEOUT = int(os.environ.get("OLLAMA_BROAD_TIMEOUT", "300"))
+OLLAMA_HIDDEN_TIMEOUT = int(os.environ.get("OLLAMA_HIDDEN_TIMEOUT", str(OLLAMA_VERIFY_TIMEOUT)))
+ANALYSIS_CONCURRENCY = max(1, int(os.environ.get("ANALYSIS_CONCURRENCY", "1")))
+JOB_RETENTION_SECONDS = max(60, int(os.environ.get("JOB_RETENTION_SECONDS", "3600")))
 CSV_ANALYSIS_ROWS = int(os.environ.get("CSV_ANALYSIS_ROWS", "60"))
 CSV_HEAD_ROWS = int(os.environ.get("CSV_HEAD_ROWS", "6"))
 CSV_TAIL_ROWS = int(os.environ.get("CSV_TAIL_ROWS", "6"))
 CSV_MAX_COLUMNS = int(os.environ.get("CSV_MAX_COLUMNS", "16"))
+CSV_EXTRA_SPARSE_COLUMNS = int(os.environ.get("CSV_EXTRA_SPARSE_COLUMNS", "6"))
 CSV_MAX_CELL_LEN = int(os.environ.get("CSV_MAX_CELL_LEN", "80"))
 CSV_SAMPLE_VALUES = int(os.environ.get("CSV_SAMPLE_VALUES", "8"))
 CSV_DIGIT_SAMPLE = int(os.environ.get("CSV_DIGIT_SAMPLE", "32"))
@@ -84,6 +94,8 @@ COMMON_TEXT_BIGRAMS = (
     "TI", "ES", "OR", "TE", "OF", "ED", "IS", "IT", "AL", "AR",
     "ST", "TO", "NT", "NG", "SE", "HA", "AS", "OU", "IO", "LE",
 )
+NAME_LIKE_COLUMN_RE = re.compile(r"(vendor|name|payee|merchant|customer|client|supplier|approvedby)", re.IGNORECASE)
+ORDER_EXCLUDED_COLUMN_RE = re.compile(r"(id|date|time|amount|total|price|qty|quantity|invoice|claim|account|number|employee)", re.IGNORECASE)
 FAMILY_VALIDATOR_THRESHOLDS = {
     "Binary or bit-pattern encoding in numeric values": 4,
     "Acrostic, initial, or ordered text-fragment encoding": 4,
@@ -218,11 +230,26 @@ SPECIFIC_TECHNIQUE_PHRASES = [
 
 _jobs_lock = threading.Lock()
 _jobs: dict[str, dict] = {}
+_analysis_semaphore = threading.Semaphore(ANALYSIS_CONCURRENCY)
 
 def _hex_preview(data: bytes, limit: int) -> str:
     if len(data) <= limit:
         return data.hex()
     return f"{data[:limit].hex()}...({len(data)} bytes total)"
+
+
+def _evenly_spaced_indices(total_items: int, limit: int) -> set[int]:
+    if total_items <= 0 or limit <= 0:
+        return set()
+    if total_items <= limit:
+        return set(range(total_items))
+
+    indices = {0, total_items - 1}
+    step = max((total_items - 1) / max(limit - 1, 1), 1)
+    for position in range(limit):
+        indices.add(min(total_items - 1, int(round(position * step))))
+    return indices
+
 
 def _extract_strings(data: bytes) -> list[str]:
     results: list[str] = []
@@ -459,18 +486,50 @@ def _extract_middle_initial_payload(values: list[str]) -> str | None:
 
 def _extract_cross_row_phrase(values: list[str]) -> str | None:
     fragments: list[str] = []
-    for value in values:
-        words = re.findall(r"[A-Za-z]{2,}", str(value or ""))
-        if not words:
+    seen: set[tuple[str, str]] = set()
+    for raw_value in values:
+        text = re.sub(r"\s+", " ", str(raw_value or "").strip())
+        if not text:
             continue
-        fragment = words[0]
-        if len(fragment) > 10:
-            fragment = fragment[:10]
-        fragments.append(fragment)
-    if len(fragments) < 3:
+
+        candidate_fragment = ""
+        base_text = ""
+
+        spaced_suffix = re.match(r"^(.*\b[A-Za-z]{3,}.*?)\s+([@#%&A-Za-z0-9]{1,4})$", text)
+        if spaced_suffix:
+            base_text = spaced_suffix.group(1).strip()
+            candidate_fragment = spaced_suffix.group(2).strip()
+        else:
+            attached_suffix = re.match(r"^(.*\b[A-Za-z]{4,})([@#%&0-9A-Z]{1,3})$", text)
+            if attached_suffix:
+                base_text = attached_suffix.group(1).strip()
+                candidate_fragment = attached_suffix.group(2).strip()
+
+        if not candidate_fragment or not base_text:
+            continue
+        if len(base_text) < 6:
+            continue
+        if candidate_fragment.lower() in {"usd", "eur", "gbp", "cad", "aud", "net"}:
+            continue
+        if candidate_fragment.isdigit() and len(candidate_fragment) < 2:
+            continue
+
+        key = (base_text.lower(), candidate_fragment.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        fragments.append(candidate_fragment)
+
+    distinct_fragments = _dedupe_items(fragments, limit=8)
+    if len(distinct_fragments) < 3:
         return None
-    joined = "".join(fragments[:6])
-    if _score_hidden_payload_text(joined) < 24:
+    if all(fragment.isdigit() for fragment in distinct_fragments):
+        return None
+
+    joined = "".join(distinct_fragments[:6])
+    if len(joined) < 4:
+        return None
+    if _score_hidden_payload_text(joined) < 8:
         return None
     return joined
 
@@ -479,15 +538,17 @@ def _detect_sequence_anomaly(rows: list[dict[str, str]]) -> tuple[str, str] | No
     if len(rows) < 3:
         return None
     columns = list(rows[0].keys())
-    for column in columns[:4]:
+    likely_ordered_column = re.compile(r"(date|time|id|number|seq|order|line|claim|invoice|txn)", re.IGNORECASE)
+    for column in columns[:6]:
+        if not likely_ordered_column.search(column):
+            continue
         values = [str(row.get(column, "")).strip() for row in rows if str(row.get(column, "")).strip()]
         if len(values) < 3:
             continue
         if all(re.fullmatch(r"\d+", value) for value in values):
             numbers = [int(value) for value in values]
-            is_increasing = all(b >= a for a, b in zip(numbers, numbers[1:]))
-            is_decreasing = all(b <= a for a, b in zip(numbers, numbers[1:]))
-            if not (is_increasing or is_decreasing):
+            inversions = sum(1 for a, b in zip(numbers, numbers[1:]) if b < a)
+            if 0 < inversions <= max(1, len(numbers) // 4):
                 return column, ",".join(values[:6])
         parsed_dates: list[datetime] = []
         for value in values[:6]:
@@ -498,11 +559,74 @@ def _detect_sequence_anomaly(rows: list[dict[str, str]]) -> tuple[str, str] | No
                 break
         if len(parsed_dates) >= 3:
             timestamps = [item.timestamp() for item in parsed_dates]
-            is_increasing = all(b >= a for a, b in zip(timestamps, timestamps[1:]))
-            is_decreasing = all(b <= a for a, b in zip(timestamps, timestamps[1:]))
-            if not (is_increasing or is_decreasing):
+            inversions = sum(1 for a, b in zip(timestamps, timestamps[1:]) if b < a)
+            if 0 < inversions <= max(1, len(timestamps) // 4):
                 return column, ",".join(values[:6])
     return None
+
+
+def _detect_blank_bridge_row(rows: list[dict[str, str]]) -> dict | None:
+    if len(rows) < 3:
+        return None
+
+    columns = list(rows[0].keys())
+    candidate_columns = [
+        column for column in columns
+        if not ORDER_EXCLUDED_COLUMN_RE.search(column)
+    ]
+    if not candidate_columns:
+        return None
+
+    pair_counts: dict[str, Counter[tuple[str, str]]] = {}
+    for column in candidate_columns:
+        values = [str(row.get(column, "")).strip() for row in rows]
+        pair_counts[column] = Counter(zip(values, values[1:]))
+
+    best_match: dict | None = None
+    for row_index in range(1, len(rows) - 1):
+        row = rows[row_index]
+        populated_values = [str(row.get(column, "")).strip() for column in columns if str(row.get(column, "")).strip()]
+        if len(populated_values) > 1:
+            continue
+
+        prev_row = rows[row_index - 1]
+        next_row = rows[row_index + 1]
+        bridge_hits: list[dict[str, object]] = []
+        for column in candidate_columns:
+            previous_value = str(prev_row.get(column, "")).strip()
+            current_value = str(row.get(column, "")).strip()
+            next_value = str(next_row.get(column, "")).strip()
+            if current_value:
+                continue
+            if not previous_value or not next_value or previous_value == next_value:
+                continue
+
+            bridge_count = int(pair_counts[column].get((previous_value, next_value), 0))
+            if bridge_count < 12:
+                continue
+            bridge_hits.append(
+                {
+                    "column": column,
+                    "previous": previous_value,
+                    "next": next_value,
+                    "bridge_count": bridge_count,
+                }
+            )
+
+        if len(bridge_hits) < 2:
+            continue
+
+        bridge_hits.sort(key=lambda item: (-int(item["bridge_count"]), str(item["column"])))
+        total_bridge = sum(int(item["bridge_count"]) for item in bridge_hits)
+        match = {
+            "row_index": row_index,
+            "column_hits": bridge_hits[:4],
+            "total_bridge": total_bridge,
+        }
+        if best_match is None or total_bridge > int(best_match.get("total_bridge", 0)):
+            best_match = match
+
+    return best_match
 
 
 def _family_validator_threshold(family: str) -> int:
@@ -529,6 +653,34 @@ def _should_collect_initial(value: str) -> bool:
     if stripped.lower() in {"y", "n", "yes", "no", "true", "false"}:
         return False
     return True
+
+
+def _looks_name_like_column(header: str) -> bool:
+    return bool(NAME_LIKE_COLUMN_RE.search(str(header or "")))
+
+
+def _extract_transition_initials_phrase(sequence: str) -> tuple[str, int] | None:
+    cleaned = "".join(ch for ch in str(sequence or "").upper() if ch.isalpha())
+    if len(cleaned) < 12:
+        return None
+
+    best_phrase = ""
+    best_score = -999
+    for length in range(5, 9):
+        for start in range(0, len(cleaned) - length + 1):
+            phrase = cleaned[start : start + length]
+            score = _score_initials_signal(phrase)
+            if length >= 6:
+                score += 2
+            if phrase.startswith(("ING", "ION", "MENT")) or phrase.endswith(("ING", "ION", "MENT")):
+                score -= 4
+            if score > best_score:
+                best_phrase = phrase
+                best_score = score
+
+    if best_score < 22:
+        return None
+    return best_phrase, best_score
 
 
 def _score_hidden_payload_text(text: str) -> int:
@@ -621,8 +773,11 @@ def _score_candidate_entry(item: dict) -> int:
     kind_bonus = {
         "coordinate_pair_from_numeric_columns": 24,
         "timestamp_like": 22,
+        "timestamp_text": 20,
         "decoded_token": 18,
         "numeric_bitstream": 14,
+        "binaryish_numeric_codes": 16,
+        "transition_initials_phrase": 18,
         "text_initials": 10,
         "formula_like": 8,
         "whitespace_signal": 10,
@@ -630,11 +785,12 @@ def _score_candidate_entry(item: dict) -> int:
         "phone_like": 12,
         "cross_row_text": 12,
         "middle_initial_phrase": 12,
+        "blank_bridge_row": 20,
         "sequence_anomaly": 12,
         "identifier_like": 6,
         "coordinate_like": 6,
         "numeric_pattern": -8,
-        "metadata_comment": -12,
+        "metadata_comment": 4,
         "no_strong_candidates": -40,
     }
     score += kind_bonus.get(kind, 0)
@@ -647,9 +803,6 @@ def _score_candidate_entry(item: dict) -> int:
         score -= 10
     if kind in {"coordinate_like", "identifier_like"} and validator_score < 4:
         score -= 16
-    if kind == "metadata_comment":
-        score -= 12
-
     return score
 
 
@@ -726,9 +879,12 @@ def _build_csv_analysis_views(path: Path, strings_full: list[str]) -> dict:
         "parsed_rows_tail": [],
         "numeric_last_digits_by_column": {},
         "text_initials_by_column": {},
+        "text_transition_initials_by_column": {},
         "text_samples_by_column": {},
         "candidate_decodings": [],
         "coordinate_candidates": [],
+        "binaryish_code_candidates": [],
+        "blank_bridge_candidates": [],
     }
 
     try:
@@ -758,34 +914,69 @@ def _build_csv_analysis_views(path: Path, strings_full: list[str]) -> dict:
                 return result
 
             header_row = parsed_rows[0]
-            headers = [_compact_cell(cell) or f"col_{idx + 1}" for idx, cell in enumerate(header_row[:CSV_MAX_COLUMNS])]
             data_rows = parsed_rows[1:]
+
+            selected_indices = list(range(min(len(header_row), CSV_MAX_COLUMNS)))
+            if len(header_row) > CSV_MAX_COLUMNS and CSV_EXTRA_SPARSE_COLUMNS > 0:
+                nonempty_counts: list[tuple[int, int]] = []
+                for idx in range(CSV_MAX_COLUMNS, len(header_row)):
+                    count = 0
+                    for raw in data_rows:
+                        if idx < len(raw) and str(raw[idx]).strip():
+                            count += 1
+                    if count > 0:
+                        nonempty_counts.append((idx, count))
+                nonempty_counts.sort(key=lambda item: (item[1], item[0]))
+                selected_indices.extend(idx for idx, _ in nonempty_counts[:CSV_EXTRA_SPARSE_COLUMNS])
+                selected_indices = sorted(set(selected_indices))
+
+            headers = [
+                _compact_cell(header_row[idx]) or f"col_{idx + 1}"
+                for idx in selected_indices
+            ]
+            selected_pairs = list(zip(selected_indices, headers))
 
             sample_values: dict[str, list[str]] = {header: [] for header in headers}
             digit_sequences: dict[str, list[str]] = {header: [] for header in headers}
             initials_sequences: dict[str, list[str]] = {header: [] for header in headers}
+            transition_initials_sequences: dict[str, list[str]] = {header: [] for header in headers}
+            previous_text_value: dict[str, str] = {header: "" for header in headers}
+            short_numeric_value_counts: dict[str, Counter[str]] = {header: Counter() for header in headers}
             head_rows: list[dict[str, str]] = []
             tail_rows: deque[dict[str, str]] = deque(maxlen=CSV_TAIL_ROWS)
             candidate_tokens: list[str] = list(strings_full[:DECODE_CANDIDATE_LIMIT * 2])
             coordinate_candidates: list[dict[str, object]] = []
             lower_headers = {header.lower(): header for header in headers}
-            for raw in data_rows[:CSV_ANALYSIS_ROWS]:
+            full_row_maps: list[dict[str, str]] = []
+            sampled_row_indices = _evenly_spaced_indices(len(data_rows), CSV_ANALYSIS_ROWS)
+            for row_index, raw in enumerate(data_rows):
                 row_map: dict[str, str] = {}
-                for idx, header in enumerate(headers):
-                    value = _compact_cell(raw[idx]) if idx < len(raw) else ""
+                sampled_row = row_index in sampled_row_indices
+                for source_idx, header in selected_pairs:
+                    value = _compact_cell(raw[source_idx]) if source_idx < len(raw) else ""
                     row_map[header] = value
                     if value and len(sample_values[header]) < CSV_SAMPLE_VALUES:
                         sample_values[header].append(value)
-                    if value and len(candidate_tokens) < DECODE_CANDIDATE_LIMIT * 8:
+                    if value and sampled_row and len(candidate_tokens) < DECODE_CANDIDATE_LIMIT * 8:
                         candidate_tokens.append(value)
-                    if _looks_numeric(value):
+                    if re.fullmatch(r"\d{4,12}", value):
+                        short_numeric_value_counts[header][value] += 1
+                    if _looks_numeric(value) and sampled_row:
                         digits = "".join(ch for ch in value if ch.isdigit())
                         if digits and len("".join(digit_sequences[header])) < CSV_DIGIT_SAMPLE:
                             digit_sequences[header].append(digits[-1])
-                    else:
+                    elif value and sampled_row:
                         initial = _first_token_char(value)
                         if initial and _should_collect_initial(value) and len("".join(initials_sequences[header])) < CSV_TEXT_SAMPLE:
                             initials_sequences[header].append(initial)
+                    if value and _should_collect_initial(value):
+                        if value != previous_text_value[header]:
+                            initial = _first_token_char(value)
+                            if initial:
+                                transition_initials_sequences[header].append(initial)
+                            previous_text_value[header] = value
+                    elif value:
+                        previous_text_value[header] = value
 
                 numeric_pairs: list[tuple[str, float, str]] = []
                 for header in headers:
@@ -856,6 +1047,7 @@ def _build_csv_analysis_views(path: Path, strings_full: list[str]) -> dict:
                 if len(head_rows) < CSV_HEAD_ROWS:
                     head_rows.append(row_map)
                 tail_rows.append(row_map)
+                full_row_maps.append(row_map)
 
             result["metadata_comment_lines"] = comment_lines
             result["column_names"] = headers
@@ -871,11 +1063,36 @@ def _build_csv_analysis_views(path: Path, strings_full: list[str]) -> dict:
                 for header, values in initials_sequences.items()
                 if values
             }
+            result["text_transition_initials_by_column"] = {
+                header: "".join(values)
+                for header, values in transition_initials_sequences.items()
+                if values
+            }
             result["text_samples_by_column"] = {
                 header: values
                 for header, values in sample_values.items()
                 if values
             }
+            binaryish_code_candidates: list[dict[str, object]] = []
+            for header, counts in short_numeric_value_counts.items():
+                if not counts:
+                    continue
+                binaryish_values = [(value, count) for value, count in counts.items() if re.fullmatch(r"[01]{4,12}", value)]
+                ordinary_values = [value for value in counts if re.fullmatch(r"\d{4,12}", value) and re.search(r"[2-9]", value)]
+                if not binaryish_values or not ordinary_values:
+                    continue
+                rare_binaryish = [(value, count) for value, count in binaryish_values if count <= max(4, len(data_rows) // 40)]
+                if len(rare_binaryish) < 2 and sum(count for _, count in binaryish_values) < 4:
+                    continue
+                rare_binaryish.sort(key=lambda item: (item[1], item[0]))
+                binaryish_code_candidates.append(
+                    {
+                        "column": header,
+                        "rare_binaryish_values": [f"{value}x{count}" for value, count in rare_binaryish[:6]],
+                        "ordinary_values": sorted(ordinary_values)[:6],
+                    }
+                )
+            result["binaryish_code_candidates"] = binaryish_code_candidates[:6]
             result["candidate_decodings"] = _find_decodable_candidates(candidate_tokens)
             coordinate_candidates.sort(key=lambda item: (-int(item["score"]), str(item["row_label"]), str(item["headers"])))
             result["coordinate_candidates"] = coordinate_candidates[:8]
@@ -894,6 +1111,9 @@ def _build_csv_analysis_views(path: Path, strings_full: list[str]) -> dict:
             if zero_width_count:
                 whitespace_signals.append(f"zero-width characters detected in file text: {zero_width_count}")
             result["whitespace_signals"] = whitespace_signals[:4]
+            blank_bridge = _detect_blank_bridge_row(full_row_maps)
+            if blank_bridge:
+                result["blank_bridge_candidates"] = [blank_bridge]
             return result
     except Exception:
         app.logger.exception("Failed to build CSV analysis views for %s", path)
@@ -940,10 +1160,13 @@ def build_file_context(path: Path) -> dict:
         "parsed_rows_tail": csv_views["parsed_rows_tail"],
         "numeric_last_digits_by_column": csv_views["numeric_last_digits_by_column"],
         "text_initials_by_column": csv_views["text_initials_by_column"],
+        "text_transition_initials_by_column": csv_views.get("text_transition_initials_by_column", {}),
         "text_samples_by_column": csv_views["text_samples_by_column"],
+        "binaryish_code_candidates": csv_views.get("binaryish_code_candidates", []),
         "candidate_decodings": csv_views["candidate_decodings"],
         "coordinate_candidates": csv_views["coordinate_candidates"],
         "whitespace_signals": csv_views.get("whitespace_signals", []),
+        "blank_bridge_candidates": csv_views.get("blank_bridge_candidates", []),
     }
 
 def _decode_bitstream(bits: str, width: int) -> str | None:
@@ -998,13 +1221,14 @@ def _build_candidate_views(context: dict) -> list[dict]:
 
     for line in context.get("metadata_comment_lines", [])[:6]:
         inferred_family = _infer_specific_family([line]) or "Explicit character-code or encoded text payload"
+        explicit_hiding_comment = bool(re.search(r"hiding technique|hidden data|hidden payload", line, re.IGNORECASE))
         add_candidate(
             "metadata_comment",
             inferred_family,
             f"metadata comment present: {line}",
             line,
             literal_payload=line,
-            validator_score=0,
+            validator_score=5 if explicit_hiding_comment else 1,
             source_location="metadata comment",
         )
 
@@ -1027,6 +1251,22 @@ def _build_candidate_views(context: dict) -> list[dict]:
         if re.search(r"(date|time|year|month|day)", column, re.IGNORECASE):
             continue
         for value in values[:6]:
+            if (
+                re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", value)
+                and re.search(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)\b", value, re.IGNORECASE)
+            ):
+                evidence = f"{column} contains timestamp-like text in an otherwise generic field: {value}"
+                if evidence not in seen_timestamp_evidence:
+                    seen_timestamp_evidence.add(evidence)
+                    add_candidate(
+                        "timestamp_text",
+                        "Hidden timestamp or date encoding",
+                        evidence,
+                        value,
+                        literal_payload=value,
+                        validator_score=7,
+                        source_location=f"{column} field",
+                    )
             decoded_timestamp = _decode_numeric_datetime(value)
             if not decoded_timestamp:
                 continue
@@ -1061,6 +1301,21 @@ def _build_candidate_views(context: dict) -> list[dict]:
                 validator_score=6 + min(score, 3),
                 source_location=f"row {row_label} {headers}",
             )
+
+    for item in context.get("binaryish_code_candidates", [])[:6]:
+        column = str(item.get("column", "")).strip() or "unknown"
+        rare_values = [str(value).strip() for value in item.get("rare_binaryish_values", []) if str(value).strip()]
+        ordinary_values = [str(value).strip() for value in item.get("ordinary_values", []) if str(value).strip()]
+        if not rare_values or not ordinary_values:
+            continue
+        add_candidate(
+            "binaryish_numeric_codes",
+            "Binary or bit-pattern encoding in numeric values",
+            f"{column} contains rare binary-looking codes alongside ordinary business codes: {', '.join(rare_values[:4])}; common codes include {', '.join(ordinary_values[:3])}",
+            literal_payload=", ".join(rare_values[:4]),
+            validator_score=6,
+            source_location=f"{column} value distribution",
+        )
 
     for column, digits in context.get("numeric_last_digits_by_column", {}).items():
         if not digits:
@@ -1105,6 +1360,24 @@ def _build_candidate_views(context: dict) -> list[dict]:
                 readability_score=initials_score,
                 source_location=f"{column} initials",
             )
+
+    for column, initials in context.get("text_transition_initials_by_column", {}).items():
+        if not _looks_name_like_column(column):
+            continue
+        transition_phrase = _extract_transition_initials_phrase(initials)
+        if not transition_phrase:
+            continue
+        phrase, phrase_score = transition_phrase
+        add_candidate(
+            "transition_initials_phrase",
+            "Acrostic, initial, or ordered text-fragment encoding",
+            f"{column} transition initials form a readable ordered fragment: {phrase}",
+            phrase,
+            literal_payload=phrase,
+            validator_score=7,
+            readability_score=phrase_score,
+            source_location=f"{column} transition initials",
+        )
 
     for column, values in context.get("text_samples_by_column", {}).items():
         middle_initial_payload = _extract_middle_initial_payload(values[:8])
@@ -1204,6 +1477,31 @@ def _build_candidate_views(context: dict) -> list[dict]:
             literal_payload=sequence_preview,
             validator_score=5,
             source_location=f"{column} sampled rows",
+        )
+
+    for item in context.get("blank_bridge_candidates", [])[:2]:
+        row_index = int(item.get("row_index", -1))
+        column_hits = item.get("column_hits", [])
+        if row_index < 0 or not isinstance(column_hits, list) or len(column_hits) < 2:
+            continue
+        preview_bits = []
+        for hit in column_hits[:3]:
+            column = str(hit.get("column", "")).strip()
+            previous_value = str(hit.get("previous", "")).strip()
+            next_value = str(hit.get("next", "")).strip()
+            bridge_count = int(hit.get("bridge_count", 0) or 0)
+            if column and previous_value and next_value:
+                preview_bits.append(f"{column}: {previous_value} -> {next_value} ({bridge_count}x)")
+        if not preview_bits:
+            continue
+        add_candidate(
+            "blank_bridge_row",
+            "Sequence or row-order anomaly",
+            f"row {row_index + 2} is a sparse/blank bridge between common neighboring transitions: {'; '.join(preview_bits)}",
+            literal_payload="; ".join(preview_bits),
+            validator_score=7,
+            readability_score=24,
+            source_location=f"row {row_index + 2}",
         )
 
     if not candidates:
@@ -1370,6 +1668,41 @@ def _deterministic_candidate_decision(context: dict, candidates: list[dict]) -> 
     top_validator = int(top.get("best_validator_score", 0) or 0)
     top_readability = int(top.get("best_readability_score", 0) or 0)
     runner_validator = int(runner_up.get("best_validator_score", 0) or 0) if runner_up else 0
+    matching_candidates = [
+        item for item in candidates
+        if str(item.get("family_hint", "")).strip() == family
+    ]
+
+    metadata_comment_only = (
+        matching_candidates
+        and all(str(item.get("kind", "")).strip() == "metadata_comment" for item in matching_candidates)
+        and any(
+            re.search(r"hiding technique|hidden data|hidden payload", str(item.get("literal_payload", "")), re.IGNORECASE)
+            for item in matching_candidates
+        )
+    )
+    if metadata_comment_only:
+        evidence = _dedupe_items(
+            [
+                str(item.get("evidence", "")).strip()
+                for item in matching_candidates[:3]
+                if str(item.get("evidence", "")).strip()
+            ] + ["explicit file metadata describes a hiding-technique family"],
+            limit=3,
+        )
+        return {
+            "summary": "Financial or ledger-style tabular data.",
+            "anomalies": _canonical_anomalies_for_family(family) or "none found",
+            "hidden_indicators": _dedupe_items(
+                [
+                    f"candidate family flagged: {family}",
+                    "explicit metadata comment describes hidden-data technique",
+                ],
+                limit=3,
+            ),
+            "hidden_data": "none",
+            "evidence": evidence or "none found",
+        }
 
     if top_validator < _family_short_circuit_threshold(family):
         return None
@@ -1382,10 +1715,6 @@ def _deterministic_candidate_decision(context: dict, candidates: list[dict]) -> 
     }:
         return None
 
-    matching_candidates = [
-        item for item in candidates
-        if str(item.get("family_hint", "")).strip() == family
-    ]
     hidden_values = _rank_hidden_data_values(
         [
             _candidate_display_value(item)
@@ -1432,6 +1761,25 @@ def _extract_json_payload(output: str) -> dict | None:
     for candidate in candidates:
         try:
             parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _extract_first_json_object(output: str) -> dict | None:
+    output = output.strip()
+    if output.startswith("```"):
+        output = re.sub(r"^```(?:json)?\s*", "", output)
+        output = re.sub(r"\s*```$", "", output)
+
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(output):
+        if char != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(output[idx:])
         except json.JSONDecodeError:
             continue
         if isinstance(parsed, dict):
@@ -1701,6 +2049,20 @@ DETECTION_META_EVIDENCE_PREFIXES = (
     "fallback detection model ",
 )
 
+DETECTION_PAYLOAD_CLAIM_MARKERS = (
+    "decoded sequence",
+    "decoded payload",
+    "decoded fragments",
+    "decoded content",
+    "decoded text",
+    "readable text",
+    "readable decode",
+    "reconstructed",
+    "reconstructed content",
+    "payload is",
+    "sequence is",
+)
+
 
 def _is_boilerplate_detection_clue(clue: str) -> bool:
     normalized = clue.strip().lower()
@@ -1728,6 +2090,93 @@ def _detection_clues_from_result(parsed: dict) -> list[str]:
         elif isinstance(value, str) and value.strip():
             clues.append(value.strip())
     return clues
+
+
+def _extract_detection_tokens(text: str) -> list[str]:
+    if not text:
+        return []
+
+    tokens: list[str] = []
+    token_patterns = (
+        r"[a-z0-9._%+-]+@[a-z0-9.-]+",
+        r'["\'"`]{1}([^"\'"`]{4,80})["\'"`]{1}',
+        r"\b[a-z0-9][a-z0-9._%+-]{5,}\b",
+    )
+    for pattern in token_patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            token = match if isinstance(match, str) else next((item for item in match if item), "")
+            token = str(token).strip().lower()
+            if token:
+                tokens.append(token)
+    return _dedupe_items(tokens, limit=24)
+
+
+def _clue_contains_ungrounded_payload_claim(clue: str, grounding_text: str) -> bool:
+    normalized = clue.strip()
+    if not normalized:
+        return False
+
+    lowered = normalized.lower()
+    has_payload_marker = any(marker in lowered for marker in DETECTION_PAYLOAD_CLAIM_MARKERS)
+    has_email_like = bool(re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+", lowered))
+    if not has_payload_marker and not has_email_like:
+        return False
+
+    if not grounding_text:
+        return True
+
+    tokens = _extract_detection_tokens(normalized)
+    if not tokens:
+        return has_payload_marker
+
+    return any(token not in grounding_text for token in tokens)
+
+
+def _sanitize_detection_payload(parsed: dict, grounding_text: str) -> dict:
+    if not isinstance(parsed, dict):
+        return parsed
+
+    sanitized = dict(parsed)
+    for field_name in (
+        "selected_indicator_phrase",
+        "hidden_indicators",
+        "anomalies",
+        "evidence",
+    ):
+        value = sanitized.get(field_name)
+        if isinstance(value, list):
+            filtered = [
+                str(item).strip()
+                for item in value
+                if str(item).strip() and not _clue_contains_ungrounded_payload_claim(str(item), grounding_text)
+            ]
+            sanitized[field_name] = filtered or "none found"
+        elif isinstance(value, str) and _clue_contains_ungrounded_payload_claim(value, grounding_text):
+            sanitized[field_name] = "none found"
+
+    hidden_data = sanitized.get("hidden_data", "none")
+    if isinstance(hidden_data, list):
+        filtered_hidden = [
+            str(item).strip()
+            for item in hidden_data
+            if str(item).strip()
+            and str(item).strip().lower() in grounding_text
+            and not _clue_contains_ungrounded_payload_claim(str(item), grounding_text)
+        ]
+        sanitized["hidden_data"] = filtered_hidden or "none"
+    else:
+        hidden_data_text = str(hidden_data).strip()
+        if (
+            hidden_data_text
+            and hidden_data_text.lower() not in {"none", "none found"}
+            and (
+                hidden_data_text.lower() not in grounding_text
+                or _clue_contains_ungrounded_payload_claim(hidden_data_text, grounding_text)
+            )
+        ):
+            sanitized["hidden_data"] = "none"
+
+    return sanitized
 
 
 def _clue_has_specific_locator(clue: str) -> bool:
@@ -1783,8 +2232,6 @@ def _has_concrete_hidden_presence_evidence(parsed: dict, family: str | None) -> 
             "initial",
             "concatenate",
             "cross-row",
-            "fragment",
-            "fragments",
             "formula",
             "executable",
             "whitespace",
@@ -1797,8 +2244,6 @@ def _has_concrete_hidden_presence_evidence(parsed: dict, family: str | None) -> 
             "outlier",
             "sequence",
             "identifier-like",
-            "decoded",
-            "decode",
         )
         return any(
             marker in clue.lower()
@@ -2224,9 +2669,12 @@ def _normalize_candidate_decision_result(output: str) -> dict:
     return normalized
 
 
-def _normalize_detection_result(output: str) -> dict:
+def _normalize_detection_result(output: str, grounding_text: str = "") -> dict:
     parsed = _extract_json_payload(output)
+    if not isinstance(parsed, dict):
+        parsed = _extract_first_json_object(output)
     if isinstance(parsed, dict):
+        parsed = _sanitize_detection_payload(parsed, grounding_text.lower())
         return _collapse_legacy_result_to_detection(parsed)
     return _collapse_legacy_result_to_detection({"summary": "", "evidence": [output] if output else []})
 
@@ -2236,6 +2684,11 @@ def _repair_detection_output(raw_output: str, context_block: str, candidate_bloc
         "Detection output was off-schema; attempting schema conversion. raw_preview=%r",
         (raw_output or "")[:500],
     )
+    grounding_text = f"{context_block}\n{candidate_block}".lower()
+    salvaged = _extract_first_json_object(raw_output)
+    if isinstance(salvaged, dict):
+        app.logger.info("Detection output salvaged from first JSON fragment without model retry")
+        return _collapse_legacy_result_to_detection(_sanitize_detection_payload(salvaged, grounding_text))
     prompt = (
         "You are converting a prior analyst response into strict JSON. "
         "Do not add new analysis, code, scripts, explanations, or follow-up text. "
@@ -2244,6 +2697,7 @@ def _repair_detection_output(raw_output: str, context_block: str, candidate_bloc
         "summary must be 3 to 8 words and describe only the general document type. "
         "hidden_data_present must be exactly yes or no. "
         "evidence must be an array of 1 to 2 short generic findings and must not reveal or reconstruct any hidden payload. "
+        "Discard any decoded string, readable reconstruction, email-like token, or payload candidate that is not visibly present in the supplied file context or candidate evidence. "
         "Prefer no over guessing when the evidence is weak or conflicting. "
         f"Additional analyst guidance: {extra_guidance or 'none'}."
         f"{context_block}\n"
@@ -2251,7 +2705,7 @@ def _repair_detection_output(raw_output: str, context_block: str, candidate_bloc
         f"\nPRIOR ANALYST RESPONSE\n{raw_output}\n"
     )
     repaired_output = _run_ollama_raw(prompt, timeout=OLLAMA_VERIFY_TIMEOUT)
-    return _normalize_detection_result(repaired_output)
+    return _normalize_detection_result(repaired_output, grounding_text=grounding_text)
 
 def _repair_family_detection_output(raw_output: str, context_block: str, extra_guidance: str = "") -> dict:
     app.logger.warning(
@@ -2326,7 +2780,14 @@ def _repair_candidate_review_output(raw_output: str, context_block: str, candida
 
 def _run_ollama_raw(prompt: str, timeout: int | None = None, model: str | None = None) -> str:
     model_name = model or OLLAMA_MODEL
-    app.logger.info("Running ollama model=%s prompt_bytes=%s", model_name, len(prompt.encode("utf-8", errors="replace")))
+    timeout_seconds = timeout or OLLAMA_TIMEOUT
+    started_at = time.time()
+    app.logger.info(
+        "Running ollama model=%s prompt_bytes=%s timeout=%ss",
+        model_name,
+        len(prompt.encode("utf-8", errors="replace")),
+        timeout_seconds,
+    )
     cmd = [
         "docker",
         "exec",
@@ -2340,13 +2801,22 @@ def _run_ollama_raw(prompt: str, timeout: int | None = None, model: str | None =
         "run",
         model_name,
     ]
-    result = subprocess.run(
-        cmd,
-        input=prompt.encode("utf-8", errors="replace"),
-        capture_output=True,
-        timeout=timeout or OLLAMA_TIMEOUT,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            input=prompt.encode("utf-8", errors="replace"),
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        app.logger.warning(
+            "ollama run timed out model=%s timeout=%ss elapsed=%.1fs",
+            model_name,
+            timeout_seconds,
+            time.time() - started_at,
+        )
+        raise
     stdout_text = result.stdout.decode("utf-8", errors="replace").strip()
     stdout_error_text = _clean_runtime_message(stdout_text)
     stderr_text = _clean_runtime_message(result.stderr.decode("utf-8", errors="replace"))
@@ -2362,7 +2832,12 @@ def _run_ollama_raw(prompt: str, timeout: int | None = None, model: str | None =
         if not error_text:
             error_text = stderr_text or stdout_error_text
         raise RuntimeError(error_text or f"ollama run failed with code {result.returncode}")
-    app.logger.info("ollama run complete model=%s bytes_out=%s", model_name, len(result.stdout))
+    app.logger.info(
+        "ollama run complete model=%s bytes_out=%s elapsed=%.1fs",
+        model_name,
+        len(result.stdout),
+        time.time() - started_at,
+    )
     return stdout_text
 
 def run_ollama_prompt(prompt: str, timeout: int | None = None) -> str:
@@ -2567,6 +3042,8 @@ def _run_candidate_review_pass(
         "Treat initials-only strings as weak unless they form clearly human-readable text. "
         "Treat raw digit sequences, repeated digits, parity hints, or short decodes without a printable readable result as weak evidence. "
         "Treat timestamp/date families as strong only when a value converts cleanly to a plausible calendar date. "
+        "Treat explicit metadata comment lines in the file as grounded evidence when they directly describe a hiding technique or hidden payload family. "
+        "Treat rare binary-looking numeric codes mixed into otherwise ordinary business codes as meaningful evidence of hidden signaling. "
         "Treat coordinate families as strong only when a pair is a valid latitude/longitude pair. "
         "Treat phone-style numeric fields as strong only when they validate cleanly as a phone-number pattern. "
         "If the available evidence is weak or conflicting, prefer none found over guessing. "
@@ -2654,30 +3131,85 @@ def _run_hidden_presence_pass(
         f"{context_block}\n"
         f"\nCANDIDATE EVIDENCE\n{candidate_block}\n"
     )
+    def _run_detection_model(model_name: str) -> tuple[dict, list[str]]:
+        local_issues: list[str] = []
+        grounding_text = f"{context_block}\n{candidate_block}"
+        raw_output = _run_ollama_raw(prompt, timeout=OLLAMA_HIDDEN_TIMEOUT, model=model_name)
+        parsed_payload = _extract_json_payload(raw_output)
+        fragment_payload = parsed_payload if isinstance(parsed_payload, dict) else _extract_first_json_object(raw_output)
+        normalized_output = _normalize_detection_result(raw_output, grounding_text=grounding_text)
+        if not isinstance(parsed_payload, dict):
+            if isinstance(fragment_payload, dict):
+                app.logger.info("Hidden-presence detection output required local JSON fragment salvage")
+                if model_name == OLLAMA_MODEL:
+                    local_issues.append("hidden-presence detection required local schema salvage")
+                else:
+                    local_issues.append("fallback detection required local schema salvage")
+            else:
+                repaired = _repair_detection_output(
+                    raw_output,
+                    context_block,
+                    candidate_block,
+                    extra_guidance=extra_guidance,
+                )
+                normalized_output = repaired
+                if model_name == OLLAMA_MODEL:
+                    local_issues.append("hidden-presence detection required schema conversion")
+                else:
+                    local_issues.append("fallback detection required schema conversion")
+        normalized_output["_model_used"] = model_name
+        return normalized_output, local_issues
+
+    fallback_model = (
+        OLLAMA_FALLBACK_MODEL
+        if HIDDEN_PRESENCE_ALLOW_FALLBACK and OLLAMA_FALLBACK_MODEL and OLLAMA_FALLBACK_MODEL != OLLAMA_MODEL
+        else ""
+    )
+
     try:
-        raw_output = _run_ollama_raw(prompt, timeout=OLLAMA_VERIFY_TIMEOUT)
-        normalized = _normalize_detection_result(raw_output)
-        if not isinstance(_extract_json_payload(raw_output), dict):
-            repaired = _repair_detection_output(
-                raw_output,
-                context_block,
-                candidate_block,
-                extra_guidance=extra_guidance,
-            )
-            normalized = repaired
-            issues.append("hidden-presence detection required schema conversion")
+        normalized, extra_issues = _run_detection_model(OLLAMA_MODEL)
+        issues.extend(extra_issues)
     except subprocess.TimeoutExpired:
-        app.logger.warning("Hidden-presence detection pass timed out after %ss", OLLAMA_VERIFY_TIMEOUT)
-        issues.append("hidden-presence detection pass timed out")
-        normalized = {
-            "summary": "Financial or ledger-style tabular data with no clear hidden-data pattern.",
-            "hidden_data_present": "no",
-            "evidence": ["hidden-presence detection pass timed out"],
-        }
+        app.logger.warning("Hidden-presence detection pass timed out after %ss", OLLAMA_HIDDEN_TIMEOUT)
+        if fallback_model:
+            app.logger.warning(
+                "Primary hidden-presence model %s timed out; retrying fallback %s",
+                OLLAMA_MODEL,
+                fallback_model,
+            )
+            issues.append(f"primary detection model timed out after {OLLAMA_HIDDEN_TIMEOUT}s; retried with {fallback_model}")
+            try:
+                normalized, extra_issues = _run_detection_model(fallback_model)
+                issues.extend(extra_issues)
+            except subprocess.TimeoutExpired:
+                app.logger.warning("Fallback hidden-presence detection pass timed out after %ss", OLLAMA_HIDDEN_TIMEOUT)
+                issues.append(f"fallback detection model timed out after {OLLAMA_HIDDEN_TIMEOUT}s: {fallback_model}")
+                normalized = {
+                    "summary": "Financial or ledger-style tabular data with no clear hidden-data pattern.",
+                    "hidden_data_present": "no",
+                    "evidence": ["fallback detection model timed out"],
+                    "_model_used": fallback_model,
+                }
+            except Exception as fallback_exc:
+                app.logger.warning("Fallback hidden-presence detection pass failed: %s", fallback_exc)
+                issues.append(f"fallback detection model unavailable: {fallback_model}")
+                normalized = {
+                    "summary": "Financial or ledger-style tabular data with no clear hidden-data pattern.",
+                    "hidden_data_present": "no",
+                    "evidence": ["all detection models unavailable"],
+                    "_model_used": fallback_model,
+                }
+        else:
+            issues.append(f"hidden-presence detection pass timed out after {OLLAMA_HIDDEN_TIMEOUT}s")
+            normalized = {
+                "summary": "Financial or ledger-style tabular data with no clear hidden-data pattern.",
+                "hidden_data_present": "no",
+                "evidence": ["hidden-presence detection pass timed out"],
+                "_model_used": OLLAMA_MODEL,
+            }
     except Exception as exc:
         app.logger.warning("Hidden-presence detection pass failed: %s", exc)
-        if OLLAMA_FALLBACK_MODEL and OLLAMA_FALLBACK_MODEL != OLLAMA_MODEL and _is_ollama_runner_failure(str(exc)):
-            fallback_model = OLLAMA_FALLBACK_MODEL
+        if fallback_model and _is_ollama_runner_failure(str(exc)):
             app.logger.warning(
                 "Primary hidden-presence model %s failed; retrying fallback %s",
                 OLLAMA_MODEL,
@@ -2685,21 +3217,11 @@ def _run_hidden_presence_pass(
             )
             issues.append(f"primary detection model unavailable; retried with {fallback_model}")
             try:
-                raw_output = _run_ollama_raw(prompt, timeout=OLLAMA_VERIFY_TIMEOUT, model=fallback_model)
-                normalized = _normalize_detection_result(raw_output)
-                if not isinstance(_extract_json_payload(raw_output), dict):
-                    repaired = _repair_detection_output(
-                        raw_output,
-                        context_block,
-                        candidate_block,
-                        extra_guidance=extra_guidance,
-                    )
-                    normalized = repaired
-                    issues.append("fallback detection required schema conversion")
-                normalized["_model_used"] = fallback_model
+                normalized, extra_issues = _run_detection_model(fallback_model)
+                issues.extend(extra_issues)
             except subprocess.TimeoutExpired:
-                app.logger.warning("Fallback hidden-presence detection pass timed out after %ss", OLLAMA_VERIFY_TIMEOUT)
-                issues.append(f"fallback detection model timed out: {fallback_model}")
+                app.logger.warning("Fallback hidden-presence detection pass timed out after %ss", OLLAMA_HIDDEN_TIMEOUT)
+                issues.append(f"fallback detection model timed out after {OLLAMA_HIDDEN_TIMEOUT}s: {fallback_model}")
                 normalized = {
                     "summary": "Financial or ledger-style tabular data with no clear hidden-data pattern.",
                     "hidden_data_present": "no",
@@ -2721,6 +3243,7 @@ def _run_hidden_presence_pass(
                 "summary": "Financial or ledger-style tabular data with no clear hidden-data pattern.",
                 "hidden_data_present": "no",
                 "evidence": ["hidden-presence detection pass failed"],
+                "_model_used": OLLAMA_MODEL,
             }
     return normalized, issues
 
@@ -2728,16 +3251,24 @@ def analyze_with_known_techniques(context: dict, extra_guidance: str = "") -> st
     compact_context_block = (
         f"\n\nFILE CONTEXT\n"
         f"Filename: {context['filename']}\n"
+        f"Metadata comment lines: {json.dumps(context['metadata_comment_lines'][:4], ensure_ascii=False)}\n"
         f"Column names: {json.dumps(context['column_names'], ensure_ascii=False)}\n"
         f"Parsed CSV head rows: {json.dumps(context['parsed_rows_head'][:2], ensure_ascii=False)}\n"
+        f"Parsed CSV tail rows: {json.dumps(context['parsed_rows_tail'][-2:], ensure_ascii=False)}\n"
         f"Numeric last-digit views by column: {json.dumps(context['numeric_last_digits_by_column'], ensure_ascii=False)}\n"
         f"Text initials by column: {json.dumps(context['text_initials_by_column'], ensure_ascii=False)}\n"
+        f"Rare binary-like numeric codes: {json.dumps(context.get('binaryish_code_candidates', [])[:4], ensure_ascii=False)}\n"
         f"Candidate decodings from fields/strings: {json.dumps(context['candidate_decodings'][:2], ensure_ascii=False)}\n"
     )
     all_candidate_views = _build_candidate_views(context)
     review_candidate_views = _prune_candidates_for_review(all_candidate_views)
     deterministic_result = _deterministic_candidate_decision(context, review_candidate_views)
     if deterministic_result is not None:
+        app.logger.info(
+            "Using deterministic hidden-presence shortcut filename=%s candidates=%s",
+            context.get("filename", "-"),
+            len(review_candidate_views),
+        )
         detection_result = _collapse_legacy_result_to_detection(deterministic_result)
         return json.dumps(detection_result, ensure_ascii=False)
 
@@ -2757,12 +3288,42 @@ def analyze_with_known_techniques(context: dict, extra_guidance: str = "") -> st
 
 def _set_job(job_id: str, **updates) -> None:
     with _jobs_lock:
+        _prune_jobs_locked()
         entry = _jobs.get(job_id, {})
         entry.update(updates)
         _jobs[job_id] = entry
 
 
-def _build_analysis_payload(filename: str, output: str) -> dict:
+def _prune_jobs_locked(now: float | None = None) -> None:
+    current_time = now if now is not None else time.time()
+    expired: list[str] = []
+    for job_id, entry in _jobs.items():
+        status = str(entry.get("status", "queued"))
+        terminal_at = entry.get("finished_at") or entry.get("created_at") or entry.get("started_at")
+        if status in {"done", "error"} and terminal_at and current_time - float(terminal_at) > JOB_RETENTION_SECONDS:
+            expired.append(job_id)
+    for job_id in expired:
+        _jobs.pop(job_id, None)
+
+
+def _run_analysis(dest: Path, prompt: str, filename: str, request_id: str = "") -> dict:
+    wait_started = time.time()
+    app.logger.info("Waiting for analysis slot filename=%s request_id=%s", filename, request_id or "-")
+    with _analysis_semaphore:
+        wait_seconds = time.time() - wait_started
+        if wait_seconds >= 1:
+            app.logger.info(
+                "Acquired analysis slot filename=%s request_id=%s wait_seconds=%.2f",
+                filename,
+                request_id or "-",
+                wait_seconds,
+            )
+        context = build_file_context(dest)
+        output = analyze_with_known_techniques(context, extra_guidance=prompt or "")
+        return _build_analysis_payload(filename, output, request_id=request_id)
+
+
+def _build_analysis_payload(filename: str, output: str, request_id: str = "") -> dict:
     try:
         analysis_result = json.loads(output)
     except Exception:
@@ -2775,6 +3336,7 @@ def _build_analysis_payload(filename: str, output: str) -> dict:
     return {
         "status": "Analysis complete",
         "filename": filename,
+        "request_id": request_id,
         "analysis_mode": "hidden_presence_only",
         "llama_model": model_used,
         "analysis_result": analysis_result,
@@ -2784,16 +3346,43 @@ def _build_analysis_payload(filename: str, output: str) -> dict:
         "server_code_source": CODE_SOURCE,
     }
 
-def _run_job(job_id: str, dest: Path, prompt: str, filename: str) -> None:
-    _set_job(job_id, status="running", started_at=time.time())
+def _run_job(job_id: str, dest: Path, prompt: str, filename: str, request_id: str) -> None:
+    _set_job(job_id, status="waiting_for_slot", started_at=time.time(), filename=filename, request_id=request_id)
     try:
-        context = build_file_context(dest)
-        output = analyze_with_known_techniques(context, extra_guidance=prompt or "")
+        wait_started = time.time()
+        app.logger.info(
+            "Waiting for queued job slot job_id=%s filename=%s request_id=%s",
+            job_id,
+            filename,
+            request_id or "-",
+        )
+        with _analysis_semaphore:
+            wait_seconds = time.time() - wait_started
+            _set_job(
+                job_id,
+                status="running",
+                worker_started_at=time.time(),
+                wait_seconds=round(wait_seconds, 3),
+                filename=filename,
+                request_id=request_id,
+            )
+            app.logger.info(
+                "Queued job acquired slot job_id=%s filename=%s request_id=%s wait_seconds=%.2f",
+                job_id,
+                filename,
+                request_id or "-",
+                wait_seconds,
+            )
+            context = build_file_context(dest)
+            output = analyze_with_known_techniques(context, extra_guidance=prompt or "")
+            result = _build_analysis_payload(filename, output, request_id=request_id)
         _set_job(
             job_id,
             status="done",
             finished_at=time.time(),
-            result=_build_analysis_payload(filename, output),
+            result=result,
+            filename=filename,
+            request_id=request_id,
         )
     except Exception as exc:
         app.logger.exception("Ollama execution failed")
@@ -2802,28 +3391,45 @@ def _run_job(job_id: str, dest: Path, prompt: str, filename: str) -> None:
             status="error",
             finished_at=time.time(),
             error=str(exc),
+            filename=filename,
+            request_id=request_id,
             result={
                 "status": "Analysis failed",
                 "filename": filename,
+                "request_id": request_id,
                 "analysis_mode": "hidden_presence_only",
                 "llama_model": OLLAMA_MODEL,
                 "llama_error": str(exc),
             },
         )
 
-def _enqueue_job(dest: Path, prompt: str, filename: str) -> str:
+def _enqueue_job(dest: Path, prompt: str, filename: str, request_id: str) -> str:
     job_id = uuid.uuid4().hex
-    _set_job(job_id, status="queued", created_at=time.time())
-    thread = threading.Thread(target=_run_job, args=(job_id, dest, prompt, filename), daemon=True)
+    _set_job(job_id, status="queued", created_at=time.time(), filename=filename, request_id=request_id)
+    thread = threading.Thread(target=_run_job, args=(job_id, dest, prompt, filename, request_id), daemon=True)
     thread.start()
     return job_id
+
+
+def _json_response(payload: dict, status_code: int):
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store, no-cache, max-age=0, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    resp.headers["Surrogate-Control"] = "no-store"
+    resp.headers["CDN-Cache-Control"] = "no-store"
+    return resp, status_code
 
 @app.route("/scan", methods=["POST"])
 def scan():
     remote_addr = request.remote_addr
     header_keys = sorted(request.headers.keys())
     app.logger.info("Incoming /scan from %s; headers: %s", remote_addr, header_keys)
-    is_remote = bool(request.headers.get("Cf-Connecting-Ip"))
+    sync_requested = str(
+        request.headers.get("X-Sync-Response")
+        or request.args.get("sync")
+        or ""
+    ).strip().lower() in {"1", "true", "yes", "sync"}
 
     filename = request.headers.get("X-Filename")
     if not filename:
@@ -2853,32 +3459,43 @@ def scan():
                 f.write(chunk)
 
     prompt = request.headers.get("X-Prompt") or request.args.get("prompt")
-    if is_remote:
-        job_id = _enqueue_job(dest, prompt, filename)
-        return jsonify({
+    request_id = (
+        request.headers.get("X-Request-Id")
+        or request.args.get("request_id")
+        or uuid.uuid4().hex
+    ).strip()
+    if not sync_requested:
+        job_id = _enqueue_job(dest, prompt, filename, request_id)
+        return _json_response({
             "status": "queued",
             "job_id": job_id,
             "status_url": f"/scan/{job_id}",
-        }), 202
+            "filename": filename,
+            "request_id": request_id,
+            "server_code_version": CODE_VERSION,
+            "server_code_source": CODE_SOURCE,
+        }, 202)
     try:
-        context = build_file_context(dest)
-        output = analyze_with_known_techniques(context, extra_guidance=prompt or "")
-        return jsonify(_build_analysis_payload(filename, output)), 200
+        return _json_response(_run_analysis(dest, prompt, filename, request_id=request_id), 200)
     except Exception as exc:
         app.logger.exception("Ollama execution failed")
-        return jsonify({
+        return _json_response({
             "status": "Analysis failed",
             "filename": filename,
+            "request_id": request_id,
             "analysis_mode": "hidden_presence_only",
             "llama_model": OLLAMA_MODEL,
             "llama_error": str(exc),
-        }), 502
+            "server_code_version": CODE_VERSION,
+            "server_code_source": CODE_SOURCE,
+        }, 502)
 
     return "File received", 200
 
 @app.route("/scan/<job_id>", methods=["GET"])
 def scan_status(job_id: str):
     with _jobs_lock:
+        _prune_jobs_locked()
         job = _jobs.get(job_id)
     if not job:
         resp = jsonify({"status": "not_found", "job_id": job_id})
@@ -2890,17 +3507,15 @@ def scan_status(job_id: str):
     payload = {
         "status": status,
         "job_id": job_id,
+        "filename": job.get("filename"),
+        "request_id": job.get("request_id"),
     }
     if status == "done":
         payload["result"] = job.get("result")
     elif status == "error":
         payload["error"] = job.get("error")
         payload["result"] = job.get("result")
-    resp = jsonify(payload)
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["Pragma"] = "no-cache"
-    resp.headers["Expires"] = "0"
-    return resp, 200
+    return _json_response(payload, 200)
 
 
 if __name__ == "__main__":
@@ -2908,3 +3523,4 @@ if __name__ == "__main__":
     app.logger.info("Server starting version=%s source=%s", CODE_VERSION, CODE_SOURCE)
     # serve(app, host="0.0.0.0", port=65432, channel_timeout=1000000, asyncore_loop_timeout=5, connection_limit=1000)
     app.run(host="0.0.0.0", port=65432)
+
