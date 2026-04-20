@@ -7,5 +7,142 @@
       "query": "input",
       "response": "output"
     }
+  },
+  "financial_csv_data_privscan": {
+    "file_name": "financial_training_data_privscan.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_known_techniques": {
+    "file_name": "financial_training_data_known_techniques.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_known_techniques_cleaned": {
+    "file_name": "financial_training_data_known_techniques_cleaned.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_qwen_round2": {
+    "file_name": "financial_training_data_qwen_round2.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_qwen_runtime": {
+    "file_name": "financial_training_data_qwen_runtime.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_qwen_family_checks": {
+    "file_name": "financial_training_data_qwen_family_checks.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_qwen_family_checks_compact": {
+    "file_name": "financial_training_data_qwen_family_checks_compact.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_qwen_candidate_review": {
+    "file_name": "financial_training_data_qwen_candidate_review.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_qwen_ranked_candidate_review": {
+    "file_name": "financial_training_data_qwen_ranked_candidate_review.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_qwen_blind_ranked_candidate_review": {
+    "file_name": "financial_training_data_qwen_blind_ranked_candidate_review.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_qwen_blind_corrective_ranked_review": {
+    "file_name": "financial_training_data_qwen_blind_corrective_ranked_review.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_qwen_router_sft": {
+    "file_name": "financial_training_data_qwen_router_sft.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_qwen_extractor_sft": {
+    "file_name": "financial_training_data_qwen_extractor_sft.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "financial_csv_data_qwen_preference_pairs": {
+    "file_name": "financial_training_data_qwen_preference_pairs.json",
+    "ranking": true,
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "chosen": "chosen",
+      "rejected": "rejected"
+    }
+  },
+  "financial_csv_data_qwen_hidden_presence": {
+    "file_name": "financial_training_data_qwen_hidden_presence.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
   }
 }
